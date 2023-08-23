@@ -15,18 +15,18 @@ const SCALED_WINDOW_HEIGHT: i32 = WINDOW_HEIGHT * SCALE;
 const SCALED_WINDOW_WIDTH: i32 = WINDOW_WIDTH * SCALE;
 
 struct CHIP8 {
-    pub display_buffer: DisplayBuffer,
+    display_buffer: DisplayBuffer,
     memory: [u8; 4096],
     v: [u8; 16],
     i: u16,
-    delay_timer: u32,
-    sound_timer: u32,
+    delay_timer: u8,
+    sound_timer: u8,
     pc: u16,
     stack: Vec<u16>,
     paused: bool,
     speed: u32,
     keys_pressed: HashMap<u8, bool>,
-    on_next_press: Option<u8>,
+    on_next_key_press: Option<Box<dyn FnOnce(&mut CHIP8, u8)>>,
 }
 
 impl CHIP8 {
@@ -68,7 +68,7 @@ impl CHIP8 {
                 (0xB, false), // c
                 (0xF, false), // v
             ]),
-            on_next_press: None,
+            on_next_key_press: None,
         }
     }
 
@@ -283,39 +283,57 @@ impl CHIP8 {
             },
             0xF000 => match opcode & 0xFF {
                 0x07 => {
-                    // Handle opcode 0xF000 with 0x07
+                    self.v[x as usize] = self.delay_timer;
                 }
                 0x0A => {
-                    // Handle opcode 0xF000 with 0x0A
+                    self.paused = true;
+
+                    let closure: Box<dyn FnOnce(&mut CHIP8, u8)> = Box::new(move |chip8, key| {
+                        chip8.v[x as usize] = key;
+                        chip8.paused = false;
+                    });
+
+                    self.on_next_key_press = Some(closure);
                 }
                 0x15 => {
-                    // Handle opcode 0xF000 with 0x15
+                    self.delay_timer = self.v[x as usize];
                 }
                 0x18 => {
-                    // Handle opcode 0xF000 with 0x18
+                    self.sound_timer = self.v[x as usize];
                 }
                 0x1E => {
-                    // Handle opcode 0xF000 with 0x1E
+                    self.i += self.v[x as usize] as u16;
                 }
                 0x29 => {
-                    // Handle opcode 0xF000 with 0x29
+                    self.i = self.v[x as usize] as u16 * 5;
                 }
                 0x33 => {
-                    // Handle opcode 0xF000 with 0x33
+                    self.memory[self.i as usize] = self.v[x as usize] / 100;
+
+                    // Get tens digit and place it in I+1. Gets a value between 0 and 99,
+                    // then divides by 10 to give us a value between 0 and 9.
+                    self.memory[self.i as usize + 1] = (self.v[x as usize] % 100) / 10;
+
+                    // Get the value of the ones (last) digit and place it in I+2.
+                    self.memory[self.i as usize + 2] = self.v[x as usize] % 10;
                 }
                 0x55 => {
-                    // Handle opcode 0xF000 with 0x55
+                    for register_index in 0..x {
+                        self.memory[self.i as usize + register_index as usize] =
+                            self.v[register_index as usize];
+                    }
                 }
                 0x65 => {
-                    // Handle opcode 0xF000 with 0x65
+                    for register_index in 0..x {
+                        self.v[register_index as usize] =
+                            self.memory[self.i as usize + register_index as usize];
+                    }
                 }
                 _ => {
-                    // Unknown opcode
                     panic!("Unknown opcode {}", opcode);
                 }
             },
             _ => {
-                // Unknown opcode
                 panic!("Unknown opcode {}", opcode);
             }
         }
@@ -324,14 +342,15 @@ impl CHIP8 {
     fn cycle(self: &mut Self) {
         for _ in 0..self.speed {
             if !self.paused {
-                let opcode : u16 = (self.memory[self.pc as usize] as u16) << 8 | self.memory[self.pc as usize + 1] as u16;
+                let opcode: u16 = (self.memory[self.pc as usize] as u16) << 8
+                    | self.memory[self.pc as usize + 1] as u16;
                 self.execute_instruction(opcode as u16);
             }
         }
 
-        // if (!self.paused) {
-        //     self.updateTimers();
-        // }
+        if !self.paused {
+            self.update_timers();
+        }
 
         // self.playSound();
         // self.renderer.render();
@@ -385,20 +404,18 @@ fn read_file_to_vec(filename: &str) -> io::Result<Vec<u8>> {
 
 pub fn main() -> Result<(), String> {
     let filename = "./roms/BLITZ";
-
-    match read_file_to_vec(filename) {
-        Ok(data) => {
-            // Successfully read the file into a Vec<u8>
-            println!("File contents: {:?}", data);
-        }
+    let data = match read_file_to_vec(filename) {
+        Ok(data) => data,
         Err(error) => {
-            // Error occurred while reading the file
-            eprintln!("Error: {}", error);
+            panic!("Error: {}", error);
         }
-    }
+    };
 
     let display_buffer = DisplayBuffer::new();
     let mut chip8 = CHIP8::new(display_buffer);
+    chip8.load_sprites_into_memory();
+
+    chip8.load_program_into_memory(&data);
 
     let keymap: HashMap<u8, u8> = HashMap::from([
         (49, 0x1),  // 1
@@ -444,10 +461,8 @@ pub fn main() -> Result<(), String> {
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
     let mut event_pump = sdl_context.event_pump()?;
 
-    chip8.display_buffer.switch(Point::new(0, 0));
-    chip8.display_buffer.switch(Point::new(10, 5));
-
     'running: loop {
+        chip8.cycle();
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. }
@@ -463,13 +478,15 @@ pub fn main() -> Result<(), String> {
                     keymod: _,
                     repeat: _,
                 } => {
-                    println!("keycode {}", keycode as i32);
                     if let Some(mapped_value) = keymap.get(&(keycode as u8)) {
                         chip8.set_key_press(*mapped_value);
-                        // println!("mapped value {}", mapped_value);
+
+                        if let Some(on_next_key_press) = chip8.on_next_key_press.take() {
+                            on_next_key_press(&mut chip8, *mapped_value);
+                            chip8.on_next_key_press = None;
+                        }
                     }
                 }
-
                 Event::KeyUp {
                     timestamp: _,
                     window_id: _,
@@ -478,10 +495,8 @@ pub fn main() -> Result<(), String> {
                     keymod: _,
                     repeat: _,
                 } => {
-                    println!("keycode {}", keycode as i32);
                     if let Some(mapped_value) = keymap.get(&(keycode as u8)) {
                         chip8.unset_key_press(*mapped_value);
-                        // println!("mapped value {}", mapped_value);
                     }
                 }
                 _ => {}
@@ -504,7 +519,6 @@ pub fn main() -> Result<(), String> {
         canvas.present();
 
         ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 30));
-        // The rest of the game loop goes here...
     }
 
     Ok(())
