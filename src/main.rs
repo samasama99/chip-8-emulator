@@ -11,17 +11,16 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::time::{Duration, SystemTime};
 
-use imgui::*;
-use imgui_sdl2::*;
-
 const WINDOW_HEIGHT: i32 = 32;
 const WINDOW_WIDTH: i32 = 64;
 const SCALE: i32 = 10;
 const SCALED_WINDOW_HEIGHT: i32 = WINDOW_HEIGHT * SCALE;
 const SCALED_WINDOW_WIDTH: i32 = WINDOW_WIDTH * SCALE;
 
+type OnKeyPressCallback = Box<dyn FnOnce(&mut CHIP8, u8)>;
+
 struct CHIP8 {
-    now: SystemTime,
+    _now: SystemTime,
     display_buffer: DisplayBuffer,
     memory: [u8; 4096],
     v: [u8; 16],
@@ -33,13 +32,13 @@ struct CHIP8 {
     paused: bool,
     speed: u32,
     keys_pressed: HashMap<u8, bool>,
-    on_next_key_press: Option<Box<dyn FnOnce(&mut CHIP8, u8)>>,
+    on_next_key_press: Option<OnKeyPressCallback>,
 }
 
 impl CHIP8 {
     fn new(display_buffer: DisplayBuffer) -> Self {
         Self {
-            now: SystemTime::now(),
+            _now: SystemTime::now(),
             display_buffer,
             memory: [0; 4096],
             v: [0; 16],
@@ -81,8 +80,6 @@ impl CHIP8 {
     }
 
     fn load_sprites_into_memory(&mut self) {
-        // Array of hex values for each sprite. Each sprite is 5 bytes.
-        // The technical reference provides us with each one of these values.
         let sprites = [
             0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
             0x20, 0x60, 0x20, 0x20, 0x70, // 1
@@ -102,22 +99,11 @@ impl CHIP8 {
             0xF0, 0x80, 0xF0, 0x80, 0x80, // F
         ];
 
-        // According to the technical reference, sprites are stored in the interpreter section of memory starting at hex 0x000
         self.memory[..sprites.len()].copy_from_slice(&sprites[..]);
     }
 
     fn load_program_into_memory(&mut self, _program: &[u8]) {
         self.memory[512..(_program.len() + 512)].copy_from_slice(_program);
-        // let test = [
-        //     0x60, 0x1F, // Set V0 to X coordinate (31)
-        //     0x61, 0x0F, // Set V1 to Y coordinate (15)
-        //     0x00, 0xE0, // clearing the window
-        //     0xA0, 0x05, // Set I to the address of sprite '1' (0x05)
-        //     0xD0, 0x15, // Draw the sprite at (V0, V1)
-        //     0x12, 0x0A, // Skip the next instructions (0x20A)
-        //     // 0x12, 0x00, // Jump to the start of the program
-        // ];
-        // self.memory[0x200..(test.len() + 0x200)].copy_from_slice(&test);
     }
 
     fn update_timers(&mut self) {
@@ -132,45 +118,23 @@ impl CHIP8 {
 
     fn execute_instruction(&mut self, opcode: u16) {
         self.pc += 2;
-
-        // We only need the 2nd nibble, so grab the value of the 2nd nibble
-        // and shift it right 8 bits to get rid of everything but that 2nd nibble.
         let x: u16 = (opcode & 0x0F00) >> 8;
-
-        // We only need the 3rd nibble, so grab the value of the 3rd nibble
-        // and shift it right 4 bits to get rid of everything but that 3rd nibble.
         let y: u16 = (opcode & 0x00F0) >> 4;
 
-        // println!("{} {:02X}", self.now.elapsed().unwrap().as_secs(), opcode);
-        // println!(
-        //     "{} {:02X} {:02X}",
-        //     self.pc,
-        //     self.memory[0x349],
-        //     self.memory[0x349 + 0x1]
-        // );
         match opcode & 0xF000 {
             0x0000 => match opcode {
                 0x00E0 => {
                     self.display_buffer.clear();
-                    // println!("calling display clear");
                 }
                 0x00EE => {
                     self.pc = self.stack.pop().unwrap();
                 }
                 _ => {
-                    // Unknown opcode
                     panic!("Unknown opcode {}", opcode);
                 }
             },
             0x1000 => {
-                // let next_op: u16 = (self.memory[(opcode & 0x0FFF) as usize] as u16) << 8
-                //     | self.memory[(opcode & 0x0FFF) as usize + 1] as u16;
-
-                // if next_op == opcode {
-                //     self.pc += 2;
-                // } else {
                 self.pc = opcode & 0x0FFF;
-                // }
             }
             0x2000 => {
                 self.stack.push(self.pc);
@@ -243,7 +207,6 @@ impl CHIP8 {
                     self.v[x as usize] <<= 1;
                 }
                 _ => {
-                    // Unknown opcode
                     panic!("Unknown opcode {}", opcode);
                 }
             },
@@ -270,15 +233,11 @@ impl CHIP8 {
 
                 self.v[0xF] = 0;
 
-                // dbg!(self.i);
-
                 for row in 0..height {
                     let mut sprite = self.memory[self.i as usize + row as usize];
 
                     for col in 0..width {
-                        // If the bit (sprite) is not 0, render/erase the pixel
                         if (sprite & 0x80) > 0 {
-                            // If setPixel returns 1, which means a pixel was erased, set VF to 1
                             if self.display_buffer.toggle_pixel(Point::new(
                                 (self.v[x as usize] as u16 + col) as i32,
                                 (self.v[y as usize] as u16 + row) as i32,
@@ -287,8 +246,6 @@ impl CHIP8 {
                             }
                         }
 
-                        // Shift the sprite left 1. This will move the next next col/bit of the sprite into the first position.
-                        // Ex. 10010000 << 1 will become 0010000
                         sprite <<= 1;
                     }
                 }
@@ -315,10 +272,10 @@ impl CHIP8 {
                 0x0A => {
                     self.paused = true;
 
-                    let closure: Box<dyn FnOnce(&mut CHIP8, u8)> = Box::new(move |chip8, key| {
+                    let closure = Box::new(move |chip8: &mut CHIP8, key| {
                         chip8.v[x as usize] = key;
                         chip8.paused = false;
-                    });
+                    }) as Box<dyn FnOnce(&mut CHIP8, u8)>;
 
                     self.on_next_key_press = Some(closure);
                 }
@@ -337,11 +294,8 @@ impl CHIP8 {
                 0x33 => {
                     self.memory[self.i as usize] = self.v[x as usize] / 100;
 
-                    // Get tens digit and place it in I+1. Gets a value between 0 and 99,
-                    // then divides by 10 to give us a value between 0 and 9.
                     self.memory[self.i as usize + 1] = (self.v[x as usize] % 100) / 10;
 
-                    // Get the value of the ones (last) digit and place it in I+2.
                     self.memory[self.i as usize + 2] = self.v[x as usize] % 10;
                 }
                 0x55 => {
@@ -372,7 +326,6 @@ impl CHIP8 {
                 let opcode: u16 = (self.memory[self.pc as usize] as u16) << 8
                     | self.memory[self.pc as usize + 1] as u16;
                 self.execute_instruction(opcode);
-                // println!("{}", opcode);
             }
         }
 
@@ -380,7 +333,7 @@ impl CHIP8 {
             self.update_timers();
         }
 
-        // self.playSound();
+        // self.playSound(); // TODO
     }
 
     fn set_key_press(&mut self, mapped_value: u8) {
@@ -425,13 +378,6 @@ fn read_file_to_vec(filename: &str) -> io::Result<Vec<u8>> {
     let mut file = File::open(filename)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
-    println!(
-        "{:#?}",
-        buffer
-            .iter()
-            .map(|&x| format!("0x{:02X}", x))
-            .collect::<Vec<_>>()
-    );
     Ok(buffer)
 }
 
@@ -549,26 +495,3 @@ pub fn main() -> Result<(), String> {
 
     Ok(())
 }
-
-// let mut _advance = false;
-// if advance {
-// dbg!(&chip8.display_buffer);
-// dbg!(&chip8.stack);
-// dbg!(&chip8.memory);
-// dbg!(&chip8.v);
-// dbg!(&chip8.i);
-// dbg!(&chip8.delay_timer);
-// dbg!(&chip8.sound_timer);
-// dbg!(&chip8.pc);
-// dbg!(&chip8.paused);
-// dbg!(&chip8.keys_pressed);
-//
-//     advance = false;
-// }
-
-// Event::KeyDown {
-//     keycode: Some(Keycode::Return),
-//     ..
-// } => {
-//     _advance = true;
-// }
