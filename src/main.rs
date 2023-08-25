@@ -6,7 +6,13 @@ use sdl2::pixels::Color;
 use sdl2::rect::{Point, Rect};
 use sdl2::{event::Event, keyboard::Keycode};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::env;
+use std::fs::File;
+use std::io::{self, Read};
+use std::time::{Duration, SystemTime};
+
+use imgui::*;
+use imgui_sdl2::*;
 
 const WINDOW_HEIGHT: i32 = 32;
 const WINDOW_WIDTH: i32 = 64;
@@ -15,6 +21,7 @@ const SCALED_WINDOW_HEIGHT: i32 = WINDOW_HEIGHT * SCALE;
 const SCALED_WINDOW_WIDTH: i32 = WINDOW_WIDTH * SCALE;
 
 struct CHIP8 {
+    now: SystemTime,
     display_buffer: DisplayBuffer,
     memory: [u8; 4096],
     v: [u8; 16],
@@ -32,6 +39,7 @@ struct CHIP8 {
 impl CHIP8 {
     fn new(display_buffer: DisplayBuffer) -> Self {
         Self {
+            now: SystemTime::now(),
             display_buffer,
             memory: [0; 4096],
             v: [0; 16],
@@ -72,7 +80,7 @@ impl CHIP8 {
         }
     }
 
-    fn load_sprites_into_memory(self: &mut Self) {
+    fn load_sprites_into_memory(&mut self) {
         // Array of hex values for each sprite. Each sprite is 5 bytes.
         // The technical reference provides us with each one of these values.
         let sprites = [
@@ -95,18 +103,24 @@ impl CHIP8 {
         ];
 
         // According to the technical reference, sprites are stored in the interpreter section of memory starting at hex 0x000
-        for i in 0..sprites.len() {
-            self.memory[i] = sprites[i];
-        }
+        self.memory[..sprites.len()].copy_from_slice(&sprites[..]);
     }
 
-    fn load_program_into_memory(self: &mut Self, program: &[u8]) {
-        for loc in 0..program.len() {
-            self.memory[0x200 + loc] = program[loc];
-        }
+    fn load_program_into_memory(&mut self, _program: &[u8]) {
+        self.memory[512..(_program.len() + 512)].copy_from_slice(_program);
+        // let test = [
+        //     0x60, 0x1F, // Set V0 to X coordinate (31)
+        //     0x61, 0x0F, // Set V1 to Y coordinate (15)
+        //     0x00, 0xE0, // clearing the window
+        //     0xA0, 0x05, // Set I to the address of sprite '1' (0x05)
+        //     0xD0, 0x15, // Draw the sprite at (V0, V1)
+        //     0x12, 0x0A, // Skip the next instructions (0x20A)
+        //     // 0x12, 0x00, // Jump to the start of the program
+        // ];
+        // self.memory[0x200..(test.len() + 0x200)].copy_from_slice(&test);
     }
 
-    fn update_timers(self: &mut Self) {
+    fn update_timers(&mut self) {
         if self.delay_timer > 0 {
             self.delay_timer -= 1;
         };
@@ -116,7 +130,7 @@ impl CHIP8 {
         };
     }
 
-    fn execute_instruction(self: &mut Self, opcode: u16) {
+    fn execute_instruction(&mut self, opcode: u16) {
         self.pc += 2;
 
         // We only need the 2nd nibble, so grab the value of the 2nd nibble
@@ -127,10 +141,18 @@ impl CHIP8 {
         // and shift it right 4 bits to get rid of everything but that 3rd nibble.
         let y: u16 = (opcode & 0x00F0) >> 4;
 
+        // println!("{} {:02X}", self.now.elapsed().unwrap().as_secs(), opcode);
+        // println!(
+        //     "{} {:02X} {:02X}",
+        //     self.pc,
+        //     self.memory[0x349],
+        //     self.memory[0x349 + 0x1]
+        // );
         match opcode & 0xF000 {
             0x0000 => match opcode {
                 0x00E0 => {
                     self.display_buffer.clear();
+                    // println!("calling display clear");
                 }
                 0x00EE => {
                     self.pc = self.stack.pop().unwrap();
@@ -141,7 +163,14 @@ impl CHIP8 {
                 }
             },
             0x1000 => {
-                self.pc = opcode & 0xFFF;
+                // let next_op: u16 = (self.memory[(opcode & 0x0FFF) as usize] as u16) << 8
+                //     | self.memory[(opcode & 0x0FFF) as usize + 1] as u16;
+
+                // if next_op == opcode {
+                //     self.pc += 2;
+                // } else {
+                self.pc = opcode & 0x0FFF;
+                // }
             }
             0x2000 => {
                 self.stack.push(self.pc);
@@ -166,7 +195,7 @@ impl CHIP8 {
                 self.v[x as usize] = (opcode & 0xFF) as u8;
             }
             0x7000 => {
-                self.v[x as usize] += (opcode & 0xFF) as u8;
+                self.v[x as usize] = self.v[x as usize].wrapping_add((opcode & 0xFF) as u8);
             }
             0x8000 => match opcode & 0xF {
                 0x0 => {
@@ -182,12 +211,8 @@ impl CHIP8 {
                     self.v[x as usize] ^= self.v[y as usize];
                 }
                 0x4 => {
-                    // NOTE review later !!
-                    let sum = self.v[x as usize].wrapping_add(self.v[y as usize]);
-                    self.v[x as usize] = sum;
-
+                    self.v[x as usize] = self.v[x as usize].wrapping_add(self.v[y as usize]);
                     let sum: u16 = self.v[x as usize] as u16 + self.v[y as usize] as u16;
-
                     self.v[0xF] = if sum < 0xFFu16 { 1 } else { 0 };
                 }
                 0x5 => {
@@ -197,7 +222,7 @@ impl CHIP8 {
                         self.v[0xF] = 1;
                     }
 
-                    self.v[x as usize] -= self.v[y as usize];
+                    self.v[x as usize] = self.v[x as usize].wrapping_sub(self.v[y as usize]);
                 }
                 0x6 => {
                     self.v[0xF] = self.v[x as usize] & 0x1;
@@ -245,6 +270,8 @@ impl CHIP8 {
 
                 self.v[0xF] = 0;
 
+                // dbg!(self.i);
+
                 for row in 0..height {
                     let mut sprite = self.memory[self.i as usize + row as usize];
 
@@ -252,7 +279,7 @@ impl CHIP8 {
                         // If the bit (sprite) is not 0, render/erase the pixel
                         if (sprite & 0x80) > 0 {
                             // If setPixel returns 1, which means a pixel was erased, set VF to 1
-                            if self.display_buffer.switch(Point::new(
+                            if self.display_buffer.toggle_pixel(Point::new(
                                 (self.v[x as usize] as u16 + col) as i32,
                                 (self.v[y as usize] as u16 + row) as i32,
                             )) {
@@ -339,12 +366,13 @@ impl CHIP8 {
         }
     }
 
-    fn cycle(self: &mut Self) {
+    fn cycle(&mut self) {
         for _ in 0..self.speed {
             if !self.paused {
                 let opcode: u16 = (self.memory[self.pc as usize] as u16) << 8
                     | self.memory[self.pc as usize + 1] as u16;
-                self.execute_instruction(opcode as u16);
+                self.execute_instruction(opcode);
+                // println!("{}", opcode);
             }
         }
 
@@ -353,7 +381,6 @@ impl CHIP8 {
         }
 
         // self.playSound();
-        // self.renderer.render();
     }
 
     fn set_key_press(&mut self, mapped_value: u8) {
@@ -365,7 +392,7 @@ impl CHIP8 {
     }
 }
 
-// TODO: add the wraping behavior
+#[derive(Debug)]
 struct DisplayBuffer {
     pixels: [[bool; 64]; 32],
 }
@@ -377,33 +404,41 @@ impl DisplayBuffer {
         }
     }
 
-    fn switch(self: &mut Self, point: Point) -> bool {
-        self.pixels[point.y as usize][point.x as usize] =
-            !self.pixels[point.y as usize][point.x as usize];
-        self.pixels[point.y as usize][point.x as usize]
+    fn toggle_pixel(&mut self, point: Point) -> bool {
+        let wrapped_point = Point::new(point.x() % WINDOW_WIDTH, point.y() % WINDOW_HEIGHT);
+        let pixel = &mut self.pixels[wrapped_point.y as usize][wrapped_point.x as usize];
+        *pixel ^= true;
+        *pixel
     }
 
-    fn is_on(self: &Self, point: Point) -> bool {
-        self.pixels[point.y as usize][point.x as usize]
+    fn is_on(&self, point: Point) -> bool {
+        let wrapped_point = Point::new(point.x() % WINDOW_WIDTH, point.y() % WINDOW_HEIGHT);
+        self.pixels[wrapped_point.y as usize][wrapped_point.x as usize]
     }
 
-    fn clear(self: &mut Self) -> () {
+    fn clear(&mut self) {
         self.pixels = [[false; 64]; 32];
     }
 }
-
-use std::fs::File;
-use std::io::{self, Read};
 
 fn read_file_to_vec(filename: &str) -> io::Result<Vec<u8>> {
     let mut file = File::open(filename)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
+    println!(
+        "{:#?}",
+        buffer
+            .iter()
+            .map(|&x| format!("0x{:02X}", x))
+            .collect::<Vec<_>>()
+    );
     Ok(buffer)
 }
 
 pub fn main() -> Result<(), String> {
-    let filename = "./roms/BLITZ";
+    let args: Vec<String> = env::args().collect();
+    let filename = args.get(1).unwrap();
+
     let data = match read_file_to_vec(filename) {
         Ok(data) => data,
         Err(error) => {
@@ -413,8 +448,8 @@ pub fn main() -> Result<(), String> {
 
     let display_buffer = DisplayBuffer::new();
     let mut chip8 = CHIP8::new(display_buffer);
-    chip8.load_sprites_into_memory();
 
+    chip8.load_sprites_into_memory();
     chip8.load_program_into_memory(&data);
 
     let keymap: HashMap<u8, u8> = HashMap::from([
@@ -471,32 +506,24 @@ pub fn main() -> Result<(), String> {
                     ..
                 } => break 'running,
                 Event::KeyDown {
-                    timestamp: _,
-                    window_id: _,
                     keycode: Some(keycode),
-                    scancode: _,
-                    keymod: _,
-                    repeat: _,
+                    ..
                 } => {
-                    if let Some(mapped_value) = keymap.get(&(keycode as u8)) {
-                        chip8.set_key_press(*mapped_value);
+                    if let Some(&mapped_value) = keymap.get(&(keycode as u8)) {
+                        chip8.set_key_press(mapped_value);
 
                         if let Some(on_next_key_press) = chip8.on_next_key_press.take() {
-                            on_next_key_press(&mut chip8, *mapped_value);
+                            on_next_key_press(&mut chip8, mapped_value);
                             chip8.on_next_key_press = None;
                         }
                     }
                 }
                 Event::KeyUp {
-                    timestamp: _,
-                    window_id: _,
                     keycode: Some(keycode),
-                    scancode: _,
-                    keymod: _,
-                    repeat: _,
+                    ..
                 } => {
-                    if let Some(mapped_value) = keymap.get(&(keycode as u8)) {
-                        chip8.unset_key_press(*mapped_value);
+                    if let Some(&mapped_value) = keymap.get(&(keycode as u8)) {
+                        chip8.unset_key_press(mapped_value);
                     }
                 }
                 _ => {}
@@ -509,8 +536,7 @@ pub fn main() -> Result<(), String> {
             for x in 0..64 {
                 if chip8.display_buffer.is_on(Point::new(x, y)) {
                     canvas.set_draw_color(Color::GREEN);
-                    let rectangle =
-                        Rect::new((x * 10) as i32, (y * 10) as i32, SCALE as u32, SCALE as u32);
+                    let rectangle = Rect::new(x * 10, y * 10, SCALE as u32, SCALE as u32);
                     canvas.draw_rect(rectangle).unwrap();
                     canvas.fill_rect(rectangle).unwrap();
                 }
@@ -518,8 +544,31 @@ pub fn main() -> Result<(), String> {
         }
         canvas.present();
 
-        ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 30));
+        ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
     }
 
     Ok(())
 }
+
+// let mut _advance = false;
+// if advance {
+// dbg!(&chip8.display_buffer);
+// dbg!(&chip8.stack);
+// dbg!(&chip8.memory);
+// dbg!(&chip8.v);
+// dbg!(&chip8.i);
+// dbg!(&chip8.delay_timer);
+// dbg!(&chip8.sound_timer);
+// dbg!(&chip8.pc);
+// dbg!(&chip8.paused);
+// dbg!(&chip8.keys_pressed);
+//
+//     advance = false;
+// }
+
+// Event::KeyDown {
+//     keycode: Some(Keycode::Return),
+//     ..
+// } => {
+//     _advance = true;
+// }
